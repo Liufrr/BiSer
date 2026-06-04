@@ -1,0 +1,66 @@
+# R / RStudio
+.Rhistory
+.Rdata
+.RData
+.Rproj.user
+*.Rproj
+.Ruserdata
+.Renviron
+.Rprofile
+
+# R package artifacts
+*.tar.gz
+*.Rcheck/
+vignettes/*.html
+vignettes/*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.python-version
+.ipynb_checkpoints/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# Output and data
+output/*.pdf
+output/*.png
+output/*.tiff
+output/*.RData
+output/*.csv
+data/*.RData
+data/*.csv
+data/*.rds
+
+# Generated figures
+*.pdf
+*.png
+*.tiff
+
+# Log files
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+
+# Backup files
+*副本*
+
+# IDE
+.vscode/
+.idea/
+*.sublime-*
