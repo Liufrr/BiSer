@@ -1,6 +1,9 @@
 ################################################################################
-# BiSer0608 high-noise subset (12 of the 24 submitted simulation conditions)
+# Reproduce the complete BiSer0608 simulation benchmark.
 ################################################################################
 
+source("R/methods.R")
+source("R/data_generation.R")
+source("R/metrics.R")
 source("simulations/config_submission.R")
-configs <- Filter(function(x) identical(x$noise_level, "high"), configs)
+source("simulations/run_simulation.R")

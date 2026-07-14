@@ -1,87 +1,79 @@
 ################################################################################
-# Figure 4: Discretization Penalty (Dumbbell / Shift Plots)
-#
-# Shows the performance penalty when increasing noise, comparing methods.
-# Uses paired (low vs high) simulation results.
-#
-# Required data:
-#   output/ALLout_norm_low.RData, output/ALLout_norm_high.RData
+# Figure 4: ARI before and after boundary detection in large Gaussian matrices
 ################################################################################
 
 source("R/visualization.R")
 
 library(ggplot2)
 library(dplyr)
-library(tidyr)
-library(patchwork)
 
-# ==============================================================================
-# Configuration
-# ==============================================================================
-data_low   <- "output/ALLout_norm_low.RData"
-data_high  <- "output/ALLout_norm_high.RData"
 output_dir <- "output"
+ordering_methods <- c("biser", "bs", "tsp_seri", "spec_seri", "Heatmap")
+scenarios <- data.frame(
+  file = file.path("output", c(
+    "ALLout_norm_exc_low_1000.RData",
+    "ALLout_norm_exc_high_1000.RData",
+    "ALLout_norm_low_1000.RData",
+    "ALLout_norm_high_1000.RData"
+  )),
+  Scenario = c(
+    "A  Exclusive / low noise",
+    "B  Exclusive / high noise",
+    "C  Overlapping / low noise",
+    "D  Overlapping / high noise"
+  ),
+  stringsAsFactors = FALSE
+)
 
-core_methods <- c("biser", "bs", "tsp_seri", "spec_seri", "Heatmap", "MESBC", "NMF")
-target_metrics <- c("ARI", "NMI", "purity")
-
-# ==============================================================================
-# Load and aggregate
-# ==============================================================================
-load(data_low);  allmetric_low  <- ALLout$allmetric
-load(data_high); allmetric_high <- ALLout$allmetric
-
-extract_means <- function(allmetric, methods, metrics) {
-  bind_rows(lapply(allmetric, function(m) {
-    df <- as.data.frame(m)
-    df$Method <- rownames(df)
-    df
+extract_scenario <- function(path, label) {
+  if (!file.exists(path)) stop("Missing simulation output: ", path)
+  env <- new.env(parent = emptyenv())
+  load(path, envir = env)
+  bind_rows(lapply(env$ALLout$allmetric, function(metric) {
+    data.frame(
+      Method = rownames(metric),
+      ARI_pre = metric[, "ARI_pre"],
+      ARI_post = metric[, "ARI_post"],
+      stringsAsFactors = FALSE
+    )
   })) %>%
-    filter(Method %in% methods) %>%
-    select(Method, all_of(metrics)) %>%
+    filter(Method %in% ordering_methods) %>%
     group_by(Method) %>%
-    summarise(across(everything(), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+    summarise(
+      ARI_pre = mean(ARI_pre, na.rm = TRUE),
+      ARI_post = mean(ARI_post, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(Scenario = label, Penalty = ARI_pre - ARI_post)
 }
 
-mean_low  <- extract_means(allmetric_low,  core_methods, target_metrics)
-mean_high <- extract_means(allmetric_high, core_methods, target_metrics)
-
-# Combine into paired data for dumbbell plot
-combined <- inner_join(
-  mean_low  %>% pivot_longer(-Method, names_to = "Metric", values_to = "Low"),
-  mean_high %>% pivot_longer(-Method, names_to = "Metric", values_to = "High"),
-  by = c("Method", "Metric")
-) %>%
+plot_data <- bind_rows(Map(extract_scenario, scenarios$file, scenarios$Scenario)) %>%
   mutate(
-    Method = if_else(Method %in% names(display_name), display_name[Method], Method),
-    Method = factor(Method, levels = method_order),
-    Delta  = High - Low
+    Method = factor(display_name[Method], levels = method_order[1:5]),
+    Scenario = factor(Scenario, levels = scenarios$Scenario)
   )
 
-# ==============================================================================
-# Dumbbell plot
-# ==============================================================================
-dumbbell <- ggplot(combined, aes(y = Method)) +
-  geom_segment(aes(x = High, xend = Low, yend = Method, color = Method),
-               linewidth = 1.2, alpha = 0.7) +
-  geom_point(aes(x = Low, color = Method), size = 4, shape = 16) +
-  geom_point(aes(x = High, color = Method), size = 4, shape = 17) +
-  facet_wrap(~ Metric, scales = "free_x", nrow = 1) +
+fig4 <- ggplot(plot_data, aes(x = Method, color = Method)) +
+  geom_segment(aes(y = ARI_post, yend = ARI_pre, xend = Method),
+               linewidth = 1, alpha = 0.75) +
+  geom_point(aes(y = ARI_pre), shape = 21, fill = "white", size = 3.4,
+             stroke = 1) +
+  geom_point(aes(y = ARI_post), shape = 16, size = 3.4) +
+  geom_text(aes(y = pmin(ARI_pre, ARI_post) - 0.035,
+                label = sprintf("%.2f", Penalty)),
+            vjust = 1, size = 3.4, color = "black") +
+  facet_wrap(~Scenario, nrow = 2) +
   scale_color_manual(values = method_colors) +
+  coord_cartesian(ylim = c(0, 1)) +
   theme_pub +
   theme(
-    strip.text      = element_text(size = 16, face = "bold"),
-    legend.position = "none",
-    axis.text.y     = element_text(size = 14)
+    strip.text = element_text(face = "bold", size = 13),
+    axis.text.x = element_text(angle = 35, hjust = 1, size = 10),
+    legend.position = "none"
   ) +
-  labs(x = "Score (circle = Low noise, triangle = High noise)", y = NULL)
+  labs(x = NULL, y = "ARI (open: pre-boundary; filled: post-boundary)")
 
-# ==============================================================================
-# Save
-# ==============================================================================
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
-
 ggsave(file.path(output_dir, "fig4_discretization_penalty.pdf"),
-       dumbbell, width = 14, height = 6, dpi = 300)
-
+       fig4, width = 13, height = 9, dpi = 300)
 cat("Figure 4 saved to", file.path(output_dir, "fig4_discretization_penalty.pdf"), "\n")

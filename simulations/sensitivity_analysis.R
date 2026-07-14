@@ -25,7 +25,8 @@ cat("Python boundary detection functions loaded\n")
 
 # ============================================================
 # 1. Parameter grid (3 parameters: window, prominence, distance)
-#    Note: original experiments do not use Gaussian smooth (smooth=0), so sigma is not swept
+#    BiSer0608 fixes Gaussian smoothing at sigma=3 and sweeps 5 x 7 x 5 = 175
+#    combinations of the remaining boundary-detection parameters.
 # ============================================================
 param_grid <- expand.grid(
   window     = c(5, 8, 10, 15, 20),
@@ -62,6 +63,8 @@ run_sensitivity_single <- function(simmat2, mat1, truelabel, rsim, csim,
       boundaries <- find_auto_boundaries(
         py_sim,
         valley     = "find_peaks",
+        smooth     = "gaussian",
+        sigma      = 3,
         window     = as.integer(param_grid$window[i]),
         prominence = param_grid$prominence[i],
         distance   = as.integer(param_grid$distance[i])
@@ -108,26 +111,32 @@ run_sensitivity_on_saved <- function(rdata_path, n_iter_use = 20,
     biser_out <- ALLout$allout[[iter]]$biser
     if (is.null(biser_out) || is.null(biser_out$sim)) next
 
-    mat <- ALLout$trueinfo[[iter]]$mat
-    truelabel_orig <- ALLout$trueinfo[[iter]]$label  # Note: this is un-shuffled!
+    info <- ALLout$trueinfo[[iter]]
+    mat <- info$mat
     m <- nrow(mat); p <- ncol(mat)
 
     # Reconstruct simmat2 (BiSer-reordered similarity matrix)
     simmat <- biser_out$sim
-    reordered <- biser_out$reordered_mat
-    simmat2 <- simmat[c(rownames(reordered), colnames(reordered)),
-                      c(rownames(reordered), colnames(reordered))]
+    joint_order <- biser_out$joint_order
+    if (is.null(joint_order)) {
+      reordered <- biser_out$reordered_mat
+      joint_order <- c(rownames(reordered), colnames(reordered))
+    }
+    simmat2 <- simmat[joint_order, joint_order, drop = FALSE]
 
-    # Reconstruct mat1 and shuffle indices
-    indr <- match(rownames(simmat)[1:m], rownames(mat))
-    indc <- match(rownames(simmat)[(m+1):(m+p)], colnames(mat))
-    mat1 <- mat[indr, indc]
+    # New BiSer0608 outputs store the exact disturbed input and its aligned
+    # ground truth. The fallback keeps compatibility with older RData files.
+    if (!is.null(info$mat_input)) {
+      mat1 <- info$mat_input
+      truelabel <- info$label
+    } else {
+      indr <- match(rownames(simmat)[seq_len(m)], rownames(mat))
+      indc <- match(rownames(simmat)[m + seq_len(p)], colnames(mat))
+      mat1 <- mat[indr, indc, drop = FALSE]
+      truelabel <- list(row = info$label$row[indr], col = info$label$col[indc])
+    }
     rsim <- cor(t(mat1))
     csim <- cor(mat1)
-
-    # Critical fix: truelabel must be reordered by indr/indc (consistent with nmf.R line 230)
-    truelabel <- list(row = truelabel_orig$row[indr],
-                      col = truelabel_orig$col[indc])
 
     # Parameter sweep
     res <- run_sensitivity_single(simmat2, mat1, truelabel, rsim, csim,
@@ -159,13 +168,13 @@ run_sensitivity_on_saved <- function(rdata_path, n_iter_use = 20,
 # Original prominence / distance parameters for each setting
 settings <- list(
   list(path = file.path("output", "ALLout_norm_low.RData"),
-       name = "norm_low",           prom = 0.002, dist = 5),
+       name = "norm_low",           prom = 0.01, dist = 5),
   list(path = file.path("output", "ALLout_norm_exc_low.RData"),
-       name = "norm_exc_low",       prom = 0.01,  dist = 10),
+       name = "norm_exc_low",       prom = 0.01, dist = 5),
   list(path = file.path("output", "ALLout_norm_low_1000.RData"),
-       name = "norm_low_1000",      prom = 0.02,  dist = 10),
+       name = "norm_low_1000",      prom = 0.01, dist = 5),
   list(path = file.path("output", "ALLout_norm_exc_low_1000.RData"),
-       name = "norm_exc_low_1000",  prom = 0.1,   dist = 5)
+       name = "norm_exc_low_1000",  prom = 0.01, dist = 5)
 )
 
 all_sensitivity <- list()
@@ -317,4 +326,3 @@ for (sname in unique(df_all$setting)) {
   ))
 }
 cat("\nDone!\n")
-

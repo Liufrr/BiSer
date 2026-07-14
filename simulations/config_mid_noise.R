@@ -60,3 +60,11 @@ configs <- list(
                     noisemean = 1, noisesize = 0.1)
   )
 )
+
+warning("config_mid_noise.R is a legacy exploratory design and is not part of BiSer0608.")
+configs <- lapply(seq_along(configs), function(i) {
+  c(configs[[i]], list(
+    seed = 20250000L + i * 1000L,
+    window = 10L, smooth = "gaussian", sigma = 3
+  ))
+})

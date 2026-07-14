@@ -109,7 +109,7 @@ mat1 <- mat0[sample(1:nrow(mat0), nrow(mat0)),
 allout <- list()
 
 # --- BiSer ---
-out <- biser(mat1, noise = TRUE, pct = 0.6, simmeth = "cor")
+out <- biser(mat1, noise = TRUE, simmeth = "t")
 allout$biser <- out
 
 # --- Spectral seriation ---

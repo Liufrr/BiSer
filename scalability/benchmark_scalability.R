@@ -36,7 +36,7 @@ comp_sizes <- c(25, 50, 75, 100, 150, 200, 300, 400, 500)
 # ==============================================================================
 # BiSer with per-step timing
 # ==============================================================================
-biser_timed <- function(mat, simmeth = "cor", noise = FALSE, pct = 0.2) {
+biser_timed <- function(mat, simmeth = "t", noise = TRUE, pct = 0.2) {
   m <- nrow(mat); p <- ncol(mat); n <- m + p
   timings <- list()
 
@@ -51,12 +51,15 @@ biser_timed <- function(mat, simmeth = "cor", noise = FALSE, pct = 0.2) {
   # Step 2: SVD
   t0 <- proc.time()
   mysvd <- svd(w.standard)
-  u <- mysvd$u; v <- mysvd$v; lambda <- mysvd$d
+  keep <- if (length(mysvd$d) > 1L) 2:length(mysvd$d) else 1L
+  u <- mysvd$u[, keep, drop = FALSE]
+  v <- mysvd$v[, keep, drop = FALSE]
+  lambda <- mysvd$d[keep]
   timings$svd <- (proc.time() - t0)[["elapsed"]]
 
   # Step 3: Joint embedding
   t0 <- proc.time()
-  Y <- rbind(D1 %*% u, D2 %*% v) %*% diag(lambda)
+  Y <- rbind(D1 %*% u, D2 %*% v) %*% diag(lambda, nrow = length(lambda))
   timings$embedding <- (proc.time() - t0)[["elapsed"]]
 
   # Step 4: Similarity matrix
@@ -146,10 +149,10 @@ MESBC_timed <- function(mat, K = 2:10) {
   # Model selection via modularity
   Y_full <- rbind(D1 %*% mysvd$u, D2 %*% mysvd$v) %*% diag(mysvd$d)
   g <- buildSNNGraph(t(Y_full))
-  mod <- numeric()
-  for (k_idx in 2:(ncol(clust) - 1))
-    mod[k_idx] <- modularity(g, clust[, as.character(K[k_idx])])
-  kbest <- as.character(K[which(mod == max(mod, na.rm = TRUE))[1]])
+  mod <- vapply(K, function(k) {
+    modularity(g, clust[, as.character(k)])
+  }, numeric(1))
+  kbest <- as.character(K[which.max(mod)])
   clust_best <- clust[, kbest]
 
   rowlabel <- clust_best[1:m]
@@ -245,7 +248,7 @@ for (sz in sizes) {
   for (rep_i in 1:n_rep) {
     mat <- generate_block_matrix(m = sz, p = sz, seed = 42 + rep_i)
     tryCatch({
-      res <- biser_timed(mat, simmeth = "cor", noise = FALSE)
+      res <- biser_timed(mat, simmeth = "t", noise = TRUE)
       for (step_name in names(res$timings)) {
         stepwise_results <- rbind(stepwise_results, data.frame(
           m = sz, p = sz, n = 2 * sz, rep = rep_i,
@@ -299,7 +302,7 @@ for (sz in comp_sizes) {
 
       tryCatch({
         if (meth_name == "BiSer") {
-          res     <- biser_timed(mat, simmeth = "cor", noise = FALSE)
+          res     <- biser_timed(mat, simmeth = "t", noise = TRUE)
           elapsed <- res$timings$total
 
         } else if (meth_name == "Spectral") {
@@ -388,7 +391,7 @@ for (m_val in vary_m) {
   for (rep_i in 1:n_rep) {
     mat <- generate_block_matrix(m = m_val, p = fixed_p, seed = 42 + rep_i)
     tryCatch({
-      res <- biser_timed(mat, simmeth = "cor", noise = FALSE)
+      res <- biser_timed(mat, simmeth = "t", noise = TRUE)
       for (step_name in names(res$timings)) {
         nonsq_results <- rbind(nonsq_results, data.frame(
           m = m_val, p = fixed_p, n = m_val + fixed_p,
@@ -432,7 +435,7 @@ for (sz in mem_sizes) {
   mem_before <- gc(full = TRUE)[2, 2]
 
   tryCatch({
-    res <- biser_timed(mat, simmeth = "cor", noise = FALSE)
+    res <- biser_timed(mat, simmeth = "t", noise = TRUE)
     mem_after <- gc(full = TRUE)[2, 2]
     memory_results <- rbind(memory_results, data.frame(
       m = sz, p = sz, n = n,

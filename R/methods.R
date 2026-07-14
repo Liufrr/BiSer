@@ -1,313 +1,344 @@
 ################################################################################
-# BiSer Benchmarking: Comparison Methods
-#
-# All seriation and biclustering methods used in the benchmarking study.
-# Methods included:
-#   Seriation:    BiSer, Spectral, TSP, BEA_TSP, PCA_angle, Heatmap, PCA
-#   Bipartite:    Yang BS
-#   Biclustering: MESBC, BCCC, Plaid, NMF
-#
-# Dependencies:
-#   TSP, seriation, scran, igraph, NMF, biclust
+# BiSer0608: algorithms used in the submitted benchmark
 ################################################################################
 
 library(TSP)
 library(seriation)
 library(scran)
 library(igraph)
-library(biclust)
 library(NMF)
 
-# --- Global Constants ---
+# The submitted main comparison contains exactly seven methods.
+submission_methods <- c(
+  "biser", "bs", "tsp_seri", "spec_seri", "Heatmap", "MESBC", "NMF"
+)
+methname <- submission_methods
+
+# Retained only for optional legacy analyses; these methods are not part of the
+# seven-method BiSer0608 benchmark.
 Rserimeth <- c("BEA_TSP", "PCA_angle", "Heatmap", "PCA")
-bicmeth   <- c("bccc", "plaid", "MESBC")
-methname  <- c("biser", "spec_seri", "tsp_seri", Rserimeth, "bs", bicmeth, "NMF")
+bicmeth <- c("bccc", "plaid", "MESBC")
 
-# ==============================================================================
-# BiSer: Bipartite Seriation via SVD + TSP
-# ==============================================================================
-biser <- function(mat, simmeth = "cor", noise = FALSE, pct = 0.3) {
-  m <- nrow(mat)
-  p <- ncol(mat)
-  n <- m + p
+ensure_dimnames <- function(mat) {
+  if (is.null(rownames(mat))) rownames(mat) <- paste0("r", seq_len(nrow(mat)))
+  if (is.null(colnames(mat))) colnames(mat) <- paste0("c", seq_len(ncol(mat)))
+  mat
+}
 
-  # Step 1: Normalized bipartite embedding
-  w <- as.matrix(mat + abs(min(0, range(mat)[1])))
-  d1 <- apply(w, 1, sum)
-  d2 <- apply(w, 2, sum)
-  D1 <- diag(1 / d1^0.5)
-  D2 <- diag(1 / d2^0.5)
-  w.standard <- D1 %*% w %*% D2
-  mysvd <- svd(w.standard)
-  u <- mysvd$u; v <- mysvd$v; lambda <- mysvd$d
-  Y <- rbind(D1 %*% u, D2 %*% v) %*% diag(lambda)
+prepare_bipartite_matrix <- function(mat) {
+  mat <- ensure_dimnames(as.matrix(mat))
+  if (any(!is.finite(mat))) stop("The input matrix contains non-finite values.")
 
-  # Step 2: Similarity matrix
-  if (simmeth == "t")   mat2 <- Y %*% t(Y)
-  if (simmeth == "cor") mat2 <- cor(t(Y))
-  rownames(mat2) <- colnames(mat2) <- c(rownames(mat), colnames(mat))
-
-  # Step 3: Optional sparsification
-  if (!noise) {
-    sparsify_global <- function(mat, pct = 0.2) {
-      res <- mat
-      nz_idx  <- which(res != 0)
-      nz_vals <- res[nz_idx]
-      k <- ceiling(length(nz_vals) * pct)
-      if (k > 0) {
-        th <- sort(nz_vals)[k]
-        to_zero <- nz_idx[res[nz_idx] <= th]
-        res[to_zero] <- 0
-      }
-      return(res)
-    }
-    mat2 <- sparsify_global(mat2, pct = 0.3)
+  w <- mat - min(0, min(mat))
+  keep_row <- rowSums(w) > 0
+  keep_col <- colSums(w) > 0
+  if (!any(keep_row) || !any(keep_col)) {
+    stop("No positive-degree row or column remains after preprocessing.")
   }
 
-  # Step 4: TSP-based reordering
-  row_sim  <- mat2
-  row_dist <- as.dist(max(row_sim) - row_sim)
-  row_tsp  <- insert_dummy(TSP(row_dist), label = "cut_here")
-  row_tour <- solve_TSP(row_tsp, method = "repetitive_nn",
-                        control = list(rep = 100, two_opt = TRUE))
+  # Removing zero-degree nodes can expose additional zero-degree nodes on the
+  # opposite side. Iterate until the active bipartite graph is stable.
+  repeat {
+    w_active <- w[keep_row, keep_col, drop = FALSE]
+    next_row <- keep_row
+    next_col <- keep_col
+    next_row[keep_row] <- rowSums(w_active) > 0
+    next_col[keep_col] <- colSums(w_active) > 0
+    if (identical(next_row, keep_row) && identical(next_col, keep_col)) break
+    keep_row <- next_row
+    keep_col <- next_col
+  }
 
-  # Step 5: Extract row/column ordering
-  row_order_native <- cut_tour(row_tour, cut = "cut_here", exclude_cut = TRUE)
-  tmp  <- mat2[row_order_native, row_order_native]
-  mat3 <- mat[rownames(tmp)[rownames(tmp) %in% rownames(mat)],
-              rownames(tmp)[rownames(tmp) %in% colnames(mat)]]
+  list(
+    mat = mat[keep_row, keep_col, drop = FALSE],
+    w = w[keep_row, keep_col, drop = FALSE],
+    removed_rows = rownames(mat)[!keep_row],
+    removed_cols = colnames(mat)[!keep_col]
+  )
+}
 
-  return(list(
-    reordered_mat = mat3,
-    Y   = Y,
-    sim = mat2,
-    row_order = match(rownames(mat3), rownames(mat)),
-    col_order = match(colnames(mat3), colnames(mat))
-  ))
+safe_cor_similarity <- function(x) {
+  sim <- suppressWarnings(cor(t(x), use = "pairwise.complete.obs"))
+  if (is.null(dim(sim))) sim <- matrix(sim, nrow = nrow(x), ncol = nrow(x))
+  sim[!is.finite(sim)] <- 0
+  diag(sim) <- 1
+  sim
 }
 
 # ==============================================================================
-# Spectral Seriation
+# BiSer: normalized bipartite SVD, shared embedding, and joint TSP path
+# ==============================================================================
+biser <- function(mat, simmeth = "t", noise = TRUE, pct = 0.3,
+                  sparsify = NULL, n_starts = 100L) {
+  mat <- ensure_dimnames(as.matrix(mat))
+  prep <- prepare_bipartite_matrix(mat)
+  mat_active <- prep$mat
+  w <- prep$w
+  m <- nrow(w)
+  p <- ncol(w)
+
+  if (length(prep$removed_rows) + length(prep$removed_cols) > 0L) {
+    warning("All-zero rows/columns were removed before BiSer analysis.")
+  }
+
+  d1 <- rowSums(w)
+  d2 <- colSums(w)
+  D1 <- diag(1 / sqrt(d1), nrow = m)
+  D2 <- diag(1 / sqrt(d2), nrow = p)
+  w_standard <- D1 %*% w %*% D2
+  fit <- svd(w_standard)
+
+  # The first normalized singular component is the degree-related trivial
+  # component. BiSer0608 uses every available component after that component.
+  keep <- if (length(fit$d) > 1L) 2:length(fit$d) else 1L
+  U <- fit$u[, keep, drop = FALSE]
+  V <- fit$v[, keep, drop = FALSE]
+  lambda <- fit$d[keep]
+  Y <- rbind(D1 %*% U, D2 %*% V) %*% diag(lambda, nrow = length(lambda))
+  joint_names <- c(rownames(mat_active), colnames(mat_active))
+  rownames(Y) <- joint_names
+
+  if (identical(simmeth, "t")) {
+    # Z has one row per graph node; the dimensionally valid n x n Gram matrix
+    # corresponding to the manuscript definition is K = Z Z^T.
+    sim <- tcrossprod(Y)
+  } else if (identical(simmeth, "cor")) {
+    sim <- safe_cor_similarity(Y)
+  } else {
+    stop("simmeth must be either 'cor' or 't'.")
+  }
+  rownames(sim) <- colnames(sim) <- joint_names
+
+  # `noise` is retained for backward compatibility with the original scripts.
+  # The submitted simulations use noise=TRUE and therefore no sparsification.
+  if (is.null(sparsify)) sparsify <- !isTRUE(noise)
+  if (isTRUE(sparsify)) {
+    nz <- which(sim != 0)
+    k <- ceiling(length(nz) * pct)
+    if (k > 0L) {
+      threshold <- sort(sim[nz], partial = k)[k]
+      sim[nz[sim[nz] <= threshold]] <- 0
+      diag(sim) <- 1
+    }
+  }
+
+  tsp_dist <- as.dist(max(sim) - sim)
+  tsp_problem <- insert_dummy(TSP(tsp_dist), label = "cut_here")
+  tsp_tour <- solve_TSP(
+    tsp_problem,
+    method = "repetitive_nn",
+    control = list(rep = as.integer(n_starts), two_opt = TRUE)
+  )
+  tour_order <- cut_tour(tsp_tour, cut = "cut_here", exclude_cut = TRUE)
+  joint_order <- joint_names[as.integer(tour_order)]
+
+  row_names <- joint_order[joint_order %in% rownames(mat_active)]
+  col_names <- joint_order[joint_order %in% colnames(mat_active)]
+  reordered_mat <- mat_active[row_names, col_names, drop = FALSE]
+
+  list(
+    reordered_mat = reordered_mat,
+    Y = Y,
+    sim = sim,
+    joint_order = joint_order,
+    row_order = match(row_names, rownames(mat)),
+    col_order = match(col_names, colnames(mat)),
+    retained_components = keep,
+    removed_rows = prep$removed_rows,
+    removed_cols = prep$removed_cols
+  )
+}
+
+# ==============================================================================
+# Independent seriation baselines and ablations
 # ==============================================================================
 spec_seri <- function(mat) {
-  row_dist  <- dist(mat)
-  row_ser   <- seriate(row_dist, method = "spectral")
-  row_order <- get_order(row_ser)
-
-  col_dist  <- dist(t(mat))
-  col_ser   <- seriate(col_dist, method = "spectral")
-  col_order <- get_order(col_ser)
-
-  return(list(row_order = row_order, col_order = col_order))
+  mat <- ensure_dimnames(as.matrix(mat))
+  list(
+    row_order = get_order(seriate(dist(mat), method = "spectral")),
+    col_order = get_order(seriate(dist(t(mat)), method = "spectral"))
+  )
 }
 
-# ==============================================================================
-# TSP Seriation (nearest insertion)
-# ==============================================================================
 run_tsp_seriation <- function(mat) {
-  dist_mat <- as.dist(1 - cor(t(mat)))
-  tsp      <- TSP(dist_mat)
-  tour     <- solve_TSP(tsp, method = "nearest_insertion")
-  row_order <- as.integer(tour)
+  mat <- ensure_dimnames(as.matrix(mat))
+  row_cor <- suppressWarnings(cor(t(mat), use = "pairwise.complete.obs"))
+  col_cor <- suppressWarnings(cor(mat, use = "pairwise.complete.obs"))
+  row_cor[!is.finite(row_cor)] <- 0
+  col_cor[!is.finite(col_cor)] <- 0
+  diag(row_cor) <- diag(col_cor) <- 1
 
-  dist_mat <- as.dist(1 - cor(mat))
-  tsp      <- TSP(dist_mat)
-  tour     <- solve_TSP(tsp, method = "nearest_insertion")
-  col_order <- as.integer(tour)
-
-  return(list(row_order = row_order, col_order = col_order))
+  row_tour <- solve_TSP(TSP(as.dist(1 - row_cor)), method = "nearest_insertion")
+  col_tour <- solve_TSP(TSP(as.dist(1 - col_cor)), method = "nearest_insertion")
+  list(row_order = as.integer(row_tour), col_order = as.integer(col_tour))
 }
 
-# ==============================================================================
-# R seriation package methods (BEA_TSP, PCA_angle, Heatmap, PCA)
-# ==============================================================================
 Rseriation <- function(mat, method) {
-  out <- seriate(mat - min(mat), method = method)
-  mat_reordered <- seriation::permute(mat, out)
-  return(list(
-    row_order = match(rownames(mat_reordered), rownames(mat)),
-    col_order = match(colnames(mat_reordered), colnames(mat))
-  ))
-}
+  mat <- ensure_dimnames(as.matrix(mat))
 
-# ==============================================================================
-# Yang Bipartite Spectral (BS)
-# ==============================================================================
-Yang_bs <- function(mat, method) {
-
-  # BS: second singular vector ordering
-  bs <- function(W, k.bs = 2) {
-    W <- as.matrix(W)
-    n <- nrow(W); m <- ncol(W)
-    if (is.null(dimnames(W))) {
-      rownames(W) <- paste0("r", 1:n)
-      colnames(W) <- paste0("c", 1:m)
-    }
-    rn <- rownames(W); cn <- colnames(W)
-    d1 <- apply(W, 1, sum); d2 <- apply(W, 2, sum)
-    rn0 <- rn[d1 == 0]; cn0 <- cn[d2 == 0]
-
-    W1 <- W[d1 != 0, d2 != 0]
-    d1 <- d1[d1 != 0]; d2 <- d2[d2 != 0]
-    W.tilde <- W1 / sqrt(d1)
-    W.tilde <- t(t(W.tilde) / sqrt(d2))
-    tmp <- svd(W.tilde)
-    U <- tmp$u; V <- tmp$v
-    U <- U / sqrt(d1); V <- V / sqrt(d2)
-    rownames(U) <- rownames(W1); rownames(V) <- colnames(W1)
-    U <- as.matrix(U); V <- as.matrix(V)
-    if (ncol(U) == 1 | ncol(V) == 1) k.bs <- 1
-
-    u1 <- U[, k.bs]; v1 <- V[, k.bs]
-    order.row <- order(u1); order.col <- order(v1)
-    tmp2 <- W1[order.row, order.col]
-    rn_out <- c(rownames(tmp2), rn0)
-    cn_out <- c(colnames(tmp2), cn0)
+  # "Heatmap" in the manuscript denotes optimal leaf ordering (OLO), applied
+  # independently to row and column Euclidean-distance matrices.
+  if (method %in% c("Heatmap", "OLO")) {
     return(list(
-      row_order = match(rn_out, rownames(W)),
-      col_order = match(cn_out, colnames(W))
+      row_order = get_order(seriate(dist(mat), method = "OLO")),
+      col_order = get_order(seriate(dist(t(mat)), method = "OLO"))
     ))
   }
 
-  if (method == "bs")  out <- bs(mat)
-  return(out)
+  out <- seriate(mat - min(mat), method = method)
+  reordered <- seriation::permute(mat, out)
+  list(
+    row_order = match(rownames(reordered), rownames(mat)),
+    col_order = match(colnames(reordered), colnames(mat))
+  )
+}
+
+Yang_bs <- function(mat, method = "bs") {
+  if (!identical(method, "bs")) stop("BiSer_SVD is implemented as method='bs'.")
+  mat <- ensure_dimnames(as.matrix(mat))
+  prep <- prepare_bipartite_matrix(mat)
+  W <- prep$w
+  d1 <- rowSums(W)
+  d2 <- colSums(W)
+  W_tilde <- W / sqrt(d1)
+  W_tilde <- t(t(W_tilde) / sqrt(d2))
+  fit <- svd(W_tilde)
+
+  component <- if (length(fit$d) > 1L) 2L else 1L
+  u <- fit$u[, component] / sqrt(d1)
+  v <- fit$v[, component] / sqrt(d2)
+  row_names <- c(rownames(W)[order(u)], prep$removed_rows)
+  col_names <- c(colnames(W)[order(v)], prep$removed_cols)
+  list(
+    row_order = match(row_names, rownames(mat)),
+    col_order = match(col_names, colnames(mat)),
+    component = component
+  )
 }
 
 # ==============================================================================
-# Biclustering methods (BCCC, Plaid, MESBC)
+# Biclustering baselines
 # ==============================================================================
 bicluster <- function(mat, method, K = 2:10) {
+  mat <- ensure_dimnames(as.matrix(mat))
 
-  if (method != "MESBC") {
-
-    if (method == "bcspectral") bc_res <- biclust(mat, method = BCSpectral())
-    if (method == "bccc")       bc_res <- biclust(mat, method = BCCC())
-    if (method == "plaid")      bc_res <- biclust(mat, method = BCPlaid(),
-                                                   cluster = "b",
-                                                   fit.model = ~m + a + b)
+  if (!identical(method, "MESBC")) {
+    if (!requireNamespace("biclust", quietly = TRUE)) {
+      stop("The optional 'biclust' package is required for legacy method ", method, ".")
+    }
+    bc_res <- NULL
+    if (identical(method, "bcspectral")) {
+      bc_res <- biclust::biclust(mat, method = biclust::BCSpectral())
+    }
+    if (identical(method, "bccc")) {
+      bc_res <- biclust::biclust(mat, method = biclust::BCCC())
+    }
+    if (identical(method, "plaid")) {
+      bc_res <- biclust::biclust(
+        mat, method = biclust::BCPlaid(), cluster = "b", fit.model = ~m + a + b
+      )
+    }
+    if (is.null(bc_res)) stop("Unknown biclustering method: ", method)
 
     row_labels <- apply(bc_res@RowxNumber, 1, which.max)
     col_labels <- apply(bc_res@NumberxCol, 2, which.max)
-    row_order  <- order(row_labels)
-    col_order  <- order(col_labels)
-
     return(list(
-      row_order = row_order, col_order = col_order,
-      row_label = row_labels, col_label = col_labels,
-      pred_k = bc_res@Number
+      row_order = order(row_labels), col_order = order(col_labels),
+      row_label = row_labels, col_label = col_labels, pred_k = bc_res@Number
     ))
   }
 
-  # MESBC: Multiway Embedding Spectral Biclustering
-  MESBC_fn <- function(data, K = K) {
-    m <- nrow(data); p <- ncol(data); n <- m + p
-    w <- as.matrix(data + abs(min(0, range(data)[1])))
-    d1 <- apply(w, 1, sum); d2 <- apply(w, 2, sum)
-    D1 <- diag(1 / d1^0.5); D2 <- diag(1 / d2^0.5)
-    w.standard <- D1 %*% w %*% D2
-    mysvd <- svd(w.standard)
+  prep <- prepare_bipartite_matrix(mat)
+  w <- prep$w
+  if (length(prep$removed_rows) + length(prep$removed_cols) > 0L) {
+    stop("MESBC requires positive-degree rows and columns in the benchmark matrix.")
+  }
+  m <- nrow(w)
+  p <- ncol(w)
+  D1 <- diag(1 / sqrt(rowSums(w)), nrow = m)
+  D2 <- diag(1 / sqrt(colSums(w)), nrow = p)
+  fit <- svd(D1 %*% w %*% D2)
 
-    clust <- matrix(nrow = n, ncol = length(K))
-    colnames(clust) <- as.character(K)
-    for (k in K) {
-      if (k <= p & k <= m) {
-        u <- mysvd$u[, 1:k]; v <- mysvd$v[, 1:k]; lambda <- mysvd$d[1:k]
-      } else {
-        u <- mysvd$u; v <- mysvd$v; lambda <- mysvd$d
-      }
-      u <- as.matrix(u); v <- as.matrix(v)
-      Y <- rbind(D1 %*% u, D2 %*% v) %*% diag(lambda)
-      clus.out <- kmeans(Y, centers = k, iter.max = 100, nstart = 100)
-      clust[, as.character(k)] <- clus.out$cluster
-    }
-
-    if (length(K) == 1) clust <- clust[, 1]
-
-    Y_full <- rbind(D1 %*% mysvd$u, D2 %*% mysvd$v) %*% diag(mysvd$d)
-    g <- buildSNNGraph(t(Y_full))
-    mod <- numeric()
-    for (k_idx in 2:(ncol(clust) - 1))
-      mod[k_idx] <- modularity(g, clust[, as.character(K[k_idx])])
-    kbest <- as.character(which(mod == max(mod, na.rm = TRUE))[1])
-    clust <- clust[, kbest]
-
-    rowlabel <- clust[1:m]
-    collabel <- clust[(m + 1):n]
-
-    return(list(
-      row_order = order(rowlabel), col_order = order(collabel),
-      row_label = rowlabel, col_label = collabel,
-      Y = Y_full
-    ))
+  clust <- matrix(NA_integer_, nrow = m + p, ncol = length(K),
+                  dimnames = list(NULL, as.character(K)))
+  for (k in K) {
+    r <- min(k, length(fit$d))
+    Y <- rbind(
+      D1 %*% fit$u[, seq_len(r), drop = FALSE],
+      D2 %*% fit$v[, seq_len(r), drop = FALSE]
+    ) %*% diag(fit$d[seq_len(r)], nrow = r)
+    clust[, as.character(k)] <- kmeans(
+      Y, centers = k, iter.max = 100, nstart = 100
+    )$cluster
   }
 
-  if (method == "MESBC") return(MESBC_fn(mat, K))
+  Y_full <- rbind(D1 %*% fit$u, D2 %*% fit$v) %*%
+    diag(fit$d, nrow = length(fit$d))
+  graph <- buildSNNGraph(t(Y_full))
+  modularity_by_k <- vapply(K, function(k) {
+    modularity(graph, clust[, as.character(k)])
+  }, numeric(1))
+  best_k <- K[which.max(modularity_by_k)]
+  labels <- clust[, as.character(best_k)]
+  row_labels <- labels[seq_len(m)]
+  col_labels <- labels[m + seq_len(p)]
+
+  list(
+    row_order = order(row_labels), col_order = order(col_labels),
+    row_label = row_labels, col_label = col_labels,
+    pred_k = best_k, modularity = modularity_by_k, Y = Y_full
+  )
 }
 
-# ==============================================================================
-# NMF Biclustering (with modularity-based K selection)
-# ==============================================================================
-run_nmf <- function(mat, K = 2:10) {
+run_nmf <- function(mat, K = 2:10, nrun = 10L, seed = 1L) {
+  mat <- ensure_dimnames(as.matrix(mat))
+  mat_nn <- mat - min(mat) + .Machine$double.eps
 
+  # Use the same joint SNN graph and modularity selection rule as described for
+  # the submitted benchmark, evaluating every K from 2 through 10.
+  prep <- prepare_bipartite_matrix(mat_nn)
+  w <- prep$w
+  D1 <- diag(1 / sqrt(rowSums(w)), nrow = nrow(w))
+  D2 <- diag(1 / sqrt(colSums(w)), nrow = ncol(w))
+  fit <- svd(D1 %*% w %*% D2)
+  Y <- rbind(D1 %*% fit$u, D2 %*% fit$v) %*%
+    diag(fit$d, nrow = length(fit$d))
+  graph <- buildSNNGraph(t(Y))
 
-  # Build bipartite graph for modularity evaluation
-  graph_out <- function(data) {
-    m <- nrow(data); p <- ncol(data)
-    w <- as.matrix(data + abs(min(0, range(data)[1])))
-    d1 <- apply(w, 1, sum); d2 <- apply(w, 2, sum)
-    D1 <- diag(1 / d1^0.5); D2 <- diag(1 / d2^0.5)
-    w.standard <- D1 %*% w %*% D2
-    mysvd <- svd(w.standard)
-    Y <- rbind(D1 %*% mysvd$u, D2 %*% mysvd$v) %*% diag(mysvd$d)
-    g <- buildSNNGraph(t(Y))
-    return(g)
-  }
-
-  mat_nn <- mat - min(mat) + 1   # ensure non-negative
-  nmfout <- list()
-  mod <- numeric()
-  g <- graph_out(mat)
-
+  fits <- list()
+  modularity_by_k <- setNames(rep(NA_real_, length(K)), as.character(K))
   for (k in K) {
-    try({
-      nmfout[[k]] <- nmf(mat_nn, rank = k)
-    }, silent = TRUE)
-    if (k > length(nmfout)) next
-    row_cluster <- predict(nmfout[[k]], "rows")
-    col_cluster <- predict(nmfout[[k]], "columns")
-    mod[k] <- modularity(g, c(row_cluster, col_cluster))
+    result <- try(
+      nmf(mat_nn, rank = k, method = "brunet", nrun = as.integer(nrun),
+          seed = seed + k, .options = ""),
+      silent = TRUE
+    )
+    if (inherits(result, "try-error")) next
+    fits[[as.character(k)]] <- result
+    row_labels <- predict(result, "rows")
+    col_labels <- predict(result, "columns")
+    modularity_by_k[as.character(k)] <- modularity(
+      graph, c(row_labels, col_labels)
+    )
   }
 
-  # Retry once if all attempts failed
-  if (length(mod) == 0) {
-    for (k in K) {
-      try({
-        nmfout[[k]] <- nmf(mat_nn, rank = k)
-      }, silent = TRUE)
-      if (k > length(nmfout)) next
-      row_cluster <- predict(nmfout[[k]], "rows")
-      col_cluster <- predict(nmfout[[k]], "columns")
-      mod[k] <- modularity(g, c(row_cluster, col_cluster))
-    }
-  }
-
-  if (length(mod) == 0) {
+  if (all(is.na(modularity_by_k))) {
     return(list(
-      row_order = 1:nrow(mat), col_order = 1:ncol(mat),
-      row_label = rep(1, nrow(mat)), col_label = rep(1, ncol(mat)),
+      row_order = seq_len(nrow(mat)), col_order = seq_len(ncol(mat)),
+      row_label = rep(1L, nrow(mat)), col_label = rep(1L, ncol(mat)),
+      row_cluster = rep(1L, nrow(mat)), col_cluster = rep(1L, ncol(mat)),
       success = FALSE
     ))
   }
 
-  res <- nmfout[[which.max(mod)]]
-  row_cluster <- predict(res, "rows")
-  col_cluster <- predict(res, "columns")
-
-  return(list(
-    row_order   = order(row_cluster),
-    col_order   = order(col_cluster),
-    row_cluster = as.numeric(row_cluster),
-    col_cluster = as.numeric(col_cluster),
-    success     = TRUE
-  ))
+  best_k <- as.integer(names(which.max(modularity_by_k)))
+  result <- fits[[as.character(best_k)]]
+  row_labels <- as.numeric(predict(result, "rows"))
+  col_labels <- as.numeric(predict(result, "columns"))
+  list(
+    row_order = order(row_labels), col_order = order(col_labels),
+    row_label = row_labels, col_label = col_labels,
+    row_cluster = row_labels, col_cluster = col_labels,
+    pred_k = best_k, modularity = modularity_by_k, success = TRUE
+  )
 }

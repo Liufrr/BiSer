@@ -1,179 +1,220 @@
 ################################################################################
-# BiSer Benchmarking: Unified Simulation Runner
-#
-# Parameterized simulation engine that replaces the duplicated code in
-# simu_low.R, simu_mid.R, simu_high.R. Call with different config files
-# to run different scenarios.
-#
-# Usage:
-#   source("R/methods.R")
-#   source("R/data_generation.R")
-#   source("R/metrics.R")
-#   source("simulations/config_low_noise.R")   # loads 'configs' list
-#   source("simulations/run_simulation.R")      # runs all configs
+# BiSer0608 unified simulation runner
 ################################################################################
 
 library(reticulate)
-library(abind)
-library(gtools)
 
-# --- Load Python boundary detection ---
-# Adjust path as needed
 source_python("python/auto_boundaries.py")
 
-# ==============================================================================
-# Main simulation loop (runs for a single config)
-# ==============================================================================
-run_single_simulation <- function(config, output_dir = "output") {
+required_config_fields <- c(
+  "name", "generator", "n_iter", "seed", "bicrnum", "biccnum",
+  "overr", "overc", "gen_args", "window", "smooth", "sigma",
+  "prominence", "distance"
+)
 
+validate_simulation_config <- function(config) {
+  missing <- setdiff(required_config_fields, names(config))
+  if (length(missing) > 0L) {
+    stop("Configuration ", config$name %||% "<unnamed>",
+         " is missing: ", paste(missing, collapse = ", "))
+  }
+  lengths <- vapply(
+    config[c("bicrnum", "biccnum", "overr", "overc")], length, integer(1)
+  )
+  if (length(unique(lengths)) != 1L) {
+    stop("Block-size and overlap vectors must have equal lengths.")
+  }
+  invisible(TRUE)
+}
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+safe_matrix_similarity <- function(mat, margin = c("row", "col")) {
+  margin <- match.arg(margin)
+  x <- if (identical(margin, "row")) mat else t(mat)
+  sim <- suppressWarnings(cor(t(x), use = "pairwise.complete.obs"))
+  sim[!is.finite(sim)] <- 0
+  diag(sim) <- 1
+  names <- if (identical(margin, "row")) rownames(mat) else colnames(mat)
+  rownames(sim) <- colnames(sim) <- names
+  sim
+}
+
+evaluate_biser <- function(out, mat1, truelabel, config) {
+  joint_order <- out$joint_order
+  reordered_sim <- out$sim[joint_order, joint_order, drop = FALSE]
+  boundaries <- find_auto_boundaries(
+    r_to_py(reordered_sim),
+    valley = "find_peaks",
+    smooth = config$smooth,
+    window = as.integer(config$window),
+    sigma = config$sigma,
+    prominence = config$prominence,
+    distance = as.integer(config$distance)
+  )
+  matname <- list(row = rownames(mat1), col = colnames(mat1))
+  labels <- labelinput(joint_order, matname, boundaries)
+  pre_labels <- oracle_joint_partition(joint_order, truelabel, matname)
+  metric <- add_discretization_metrics(
+    overlapbic_metric(labels, truelabel), pre_labels, truelabel
+  )
+  list(
+    clus = labels, pre_clus = pre_labels, metric = metric,
+    boundaries = as.integer(boundaries)
+  )
+}
+
+run_single_simulation <- function(config, output_dir = "output") {
+  validate_simulation_config(config)
   cat("\n========================================\n")
   cat("Running:", config$name, "\n")
   cat("========================================\n")
 
-  # Unpack parameters
-  bicrnum    <- config$bicrnum
-  biccnum    <- config$biccnum
-  overr      <- config$overr
-  overc      <- config$overc
-  prominence <- config$prominence
-  distance   <- config$distance
-  n_iter     <- config$n_iter
-  gen_fn     <- config$generator     # function: generate_norm, generate_NBP, etc.
-  gen_args   <- config$gen_args      # list of extra args (bicmean, bicsd, etc.)
+  n_iter <- as.integer(config$n_iter)
+  allout <- allclus <- allpreclus <- allmetric <- trueinfo <- failures <-
+    vector("list", n_iter)
 
-  # Metric names
-  metricname <- c("NMI_row", "NMI_col", "NMI", "purity_row", "purity_col", "purity",
-                  "pathlen_row", "pathlen_col", "pathlen", "ARI_row", "ARI_col", "ARI",
-                  "smooth_row", "smooth_col", "smooth",
-                  "bandwidth_row", "bandwidth_col", "bandwidth",
-                  "block_contrast_row", "block_contrast_col", "block_contrast")
-
-  allout <- allclus <- allmetric <- trueinfo <- list()
-
-  for (iter in 1:n_iter) {
+  for (iter in seq_len(n_iter)) {
     cat("  Iteration:", iter, "/", n_iter, "\r")
+    iteration_seed <- as.integer(config$seed + iter)
+    set.seed(iteration_seed)
 
-    # Generate data
-    gen_call_args <- c(list(bicrnum = bicrnum, biccnum = biccnum,
-                            overr = overr, overc = overc), gen_args)
-    mat <- do.call(gen_fn, gen_call_args)
-    m <- nrow(mat); p <- ncol(mat)
-    rownames(mat) <- paste0("r", 1:m)
-    colnames(mat) <- paste0("c", 1:p)
+    generator_args <- c(
+      list(
+        bicrnum = config$bicrnum, biccnum = config$biccnum,
+        overr = config$overr, overc = config$overc
+      ),
+      config$gen_args
+    )
+    mat <- do.call(config$generator, generator_args)
+    m <- nrow(mat)
+    p <- ncol(mat)
+    rownames(mat) <- paste0("r", seq_len(m))
+    colnames(mat) <- paste0("c", seq_len(p))
 
-    # Shuffle
-    indr <- sample(1:m, m)
-    indc <- sample(1:p, p)
-    mat1 <- mat[indr, indc]
-    rsim <- cor(t(mat1))
-    csim <- cor(mat1)
+    row_permutation <- sample.int(m)
+    col_permutation <- sample.int(p)
+    mat1 <- mat[row_permutation, col_permutation, drop = FALSE]
+    rsim <- safe_matrix_similarity(mat1, "row")
+    csim <- safe_matrix_similarity(mat1, "col")
+    truelabel <- generate_true_labels(
+      config$bicrnum, config$biccnum, config$overr, config$overc,
+      row_permutation, col_permutation
+    )
 
-    # Ground truth labels
-    truelabel <- generate_true_labels(bicrnum, biccnum, overr, overc, indr, indc)
-    trueinfo[[iter]] <- list(mat = mat, label = truelabel)
+    trueinfo[[iter]] <- list(
+      mat = mat,
+      mat_input = mat1,
+      row_permutation = row_permutation,
+      col_permutation = col_permutation,
+      label = truelabel,
+      seed = iteration_seed
+    )
+    allout[[iter]] <- list()
+    allclus[[iter]] <- list()
+    allpreclus[[iter]] <- list()
+    failures[[iter]] <- list()
+    allmetric[[iter]] <- matrix(
+      NA_real_, nrow = length(submission_methods),
+      ncol = length(submission_metric_names),
+      dimnames = list(submission_methods, submission_metric_names)
+    )
 
-    # Initialize storage
-    allclus[[iter]] <- allout[[iter]] <- list()
-    allmetric[[iter]] <- matrix(NA, nrow = length(methname), ncol = length(metricname),
-                                dimnames = list(methname, metricname))
-
-    # --- BiSer ---
-    out <- biser(mat1, noise = TRUE, pct = 0.3)
-    allout[[iter]]$biser <- out
-    simmat <- out$sim
-    simmat2 <- simmat[c(rownames(out$reordered_mat), colnames(out$reordered_mat)),
-                      c(rownames(out$reordered_mat), colnames(out$reordered_mat))]
-    py_sim <- r_to_py(simmat2)
-    auto_boundaries <- find_auto_boundaries(py_sim, valley = "find_peaks",
-                                             prominence = prominence,
-                                             distance = distance)
-    label <- labelinput(rownames(simmat2),
-                        list(row = rownames(mat1), col = colnames(mat1)),
-                        auto_boundaries)
-    allmetric[[iter]]["biser", ] <- overlapbic_metric(label, truelabel, rsim, csim, m, p)
-    allclus[[iter]][["biser"]] <- label
-
-    # --- Spectral seriation ---
-    out <- spec_seri(mat1)
-    allout[[iter]]$spec_seri <- out
-    out2 <- seriout(out, truelabel, rsim, csim, m, p, mat1,
-                    r_to_py, find_auto_boundaries, prominence, distance)
-    allmetric[[iter]]["spec_seri", ] <- out2$metric
-    allclus[[iter]][["spec_seri"]] <- out2$clus
-
-    # --- TSP seriation ---
-    out <- run_tsp_seriation(mat1)
-    allout[[iter]]$tsp_seri <- out
-    out2 <- seriout(out, truelabel, rsim, csim, m, p, mat1,
-                    r_to_py, find_auto_boundaries, prominence, distance)
-    allmetric[[iter]]["tsp_seri", ] <- out2$metric
-    allclus[[iter]][["tsp_seri"]] <- out2$clus
-
-    # --- R seriation methods ---
-    for (i in Rserimeth) {
-      out <- Rseriation(mat1, i)
-      allout[[iter]][[i]] <- out
-      out2 <- seriout(out, truelabel, rsim, csim, m, p, mat1,
-                      r_to_py, find_auto_boundaries, prominence, distance)
-      allmetric[[iter]][i, ] <- out2$metric
-      allclus[[iter]][[i]] <- out2$clus
+    record_failure <- function(method, error) {
+      failures[[iter]][[method]] <<- conditionMessage(error)
+      message("\n[", config$name, ", iteration ", iter, ", ", method,
+              "] ", conditionMessage(error))
     }
 
-    # --- Yang BS / BS2 ---
-    for (i in c("bs", "bs2")) {
-      out <- Yang_bs(mat1, i)
-      allout[[iter]][[i]] <- out
-      out2 <- seriout(out, truelabel, rsim, csim, m, p, mat1,
-                      r_to_py, find_auto_boundaries, prominence, distance)
-      allmetric[[iter]][i, ] <- out2$metric
-      allclus[[iter]][[i]] <- out2$clus
+    # BiSer: one joint order and one joint boundary profile.
+    tryCatch({
+      out <- biser(
+        mat1, simmeth = "t", noise = TRUE,
+        n_starts = config$n_starts %||% 100L
+      )
+      evaluated <- evaluate_biser(out, mat1, truelabel, config)
+      out$boundaries <- evaluated$boundaries
+      allout[[iter]]$biser <- out
+      allclus[[iter]]$biser <- evaluated$clus
+      allpreclus[[iter]]$biser <- evaluated$pre_clus
+      allmetric[[iter]]["biser", ] <- evaluated$metric
+    }, error = function(e) record_failure("biser", e))
+
+    # Independent seriation and the two ablation variants. Row and column
+    # profiles are segmented independently, as stated in the manuscript.
+    ordering_methods <- list(
+      bs = function() Yang_bs(mat1, "bs"),
+      tsp_seri = function() run_tsp_seriation(mat1),
+      spec_seri = function() spec_seri(mat1),
+      Heatmap = function() Rseriation(mat1, "Heatmap")
+    )
+    for (method in names(ordering_methods)) {
+      tryCatch({
+        out <- ordering_methods[[method]]()
+        evaluated <- seriout(
+          out, truelabel, rsim, csim, m, p, mat1,
+          r_to_py, find_auto_boundaries,
+          prominence = config$prominence, distance = config$distance,
+          window = config$window, smooth = config$smooth, sigma = config$sigma
+        )
+        out$boundaries <- evaluated$boundaries
+        allout[[iter]][[method]] <- out
+        allclus[[iter]][[method]] <- evaluated$clus
+        allpreclus[[iter]][[method]] <- evaluated$pre_clus
+        allmetric[[iter]][method, ] <- evaluated$metric
+      }, error = function(e) record_failure(method, e))
     }
 
-    # --- Biclustering methods ---
-    for (i in bicmeth) {
-      out <- bicluster(mat1, i)
-      if (length(out[["row_order"]]) == 0) {
-        allout[[iter]][[i]] <- allclus[[iter]][[i]] <- NA
-      } else {
-        allout[[iter]][[i]] <- out
-        try({
-          allclus[[iter]][[i]] <- list(row = out$row_label, col = out$col_label)
-          allmetric[[iter]][i, ] <- overlapbic_metric(allclus[[iter]][[i]],
-                                                      truelabel, rsim, csim, m, p)
-        }, silent = TRUE)
-      }
-    }
+    # MESBC and NMF return discrete biclusters directly. A boundary-induced
+    # discretization penalty is consequently not defined for these methods.
+    tryCatch({
+      out <- bicluster(mat1, "MESBC", K = config$candidate_k %||% 2:10)
+      labels <- list(row = out$row_label, col = out$col_label)
+      allout[[iter]]$MESBC <- out
+      allclus[[iter]]$MESBC <- labels
+      allmetric[[iter]]["MESBC", ] <- overlapbic_metric(labels, truelabel)
+    }, error = function(e) record_failure("MESBC", e))
 
-    # --- NMF ---
-    nmf_out <- run_nmf(mat1)
-    allout[[iter]][["NMF"]] <- nmf_out
-    if (nmf_out$success) {
-      nmf_label <- list(row = nmf_out$row_cluster, col = nmf_out$col_cluster)
-      try({
-        allmetric[[iter]]["NMF", ] <- overlapbic_metric(nmf_label, truelabel,
-                                                         rsim, csim, m, p)
-        allclus[[iter]][["NMF"]] <- nmf_label
-      }, silent = TRUE)
-    }
+    tryCatch({
+      out <- run_nmf(
+        mat1, K = config$candidate_k %||% 2:10,
+        nrun = config$nmf_nrun %||% 10L, seed = iteration_seed
+      )
+      allout[[iter]]$NMF <- out
+      if (!isTRUE(out$success)) stop("NMF failed for every candidate rank.")
+      labels <- list(row = out$row_label, col = out$col_label)
+      allclus[[iter]]$NMF <- labels
+      allmetric[[iter]]["NMF", ] <- overlapbic_metric(labels, truelabel)
+    }, error = function(e) record_failure("NMF", e))
   }
   cat("\n")
 
-  # Save results
-  ALLout <- list(trueinfo = trueinfo, allout = allout,
-                 allclus = allclus, allmetric = allmetric)
-  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
-  save(ALLout, file = file.path(output_dir, paste0("ALLout_", config$name, ".RData")))
-  cat("Saved:", file.path(output_dir, paste0("ALLout_", config$name, ".RData")), "\n")
+  ALLout <- list(
+    config = config,
+    method_order = submission_methods,
+    metric_definitions = list(
+      separate_axis_combination = "unweighted arithmetic mean",
+      ARI_pre = "oracle segmentation using the true number and sizes of groups",
+      ARI_post = "data-driven Gaussian-smoothed boundary segmentation",
+      discretization_penalty = "ARI_pre - ARI_post"
+    ),
+    trueinfo = trueinfo,
+    allout = allout,
+    allclus = allclus,
+    allpreclus = allpreclus,
+    allmetric = allmetric,
+    failures = failures
+  )
 
-  return(ALLout)
+  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+  output_file <- file.path(output_dir, paste0("ALLout_", config$name, ".RData"))
+  save(ALLout, file = output_file)
+  cat("Saved:", output_file, "\n")
+  invisible(ALLout)
 }
 
-# ==============================================================================
-# Batch runner: iterate over all configs
-# ==============================================================================
-if (exists("configs") && is.list(configs)) {
-  for (cfg in configs) {
-    run_single_simulation(cfg, output_dir = "output")
-  }
+if (exists("configs") && is.list(configs) &&
+    !isTRUE(getOption("BiSer.skip_autorun", FALSE))) {
+  for (config in configs) run_single_simulation(config, output_dir = "output")
   cat("\nAll simulations completed.\n")
 }

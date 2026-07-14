@@ -13,7 +13,8 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.signal import argrelextrema, find_peaks
 
 
-def find_auto_boundaries(df_or_matrix, valley, smooth=0, window=10,
+def find_auto_boundaries(df_or_matrix, valley="find_peaks",
+                         smooth="gaussian", window=10,
                          sigma=3, order=5, prominence=0.01, distance=5):
     """
     Detect bicluster boundaries from a reordered similarity matrix.
@@ -27,7 +28,8 @@ def find_auto_boundaries(df_or_matrix, valley, smooth=0, window=10,
         - 'find_peaks': scipy find_peaks on inverted profile (recommended)
         - 'argrelextrema': scipy argrelextrema with elbow selection
     smooth : str or int
-        If 'gaussian', apply Gaussian smoothing before peak detection.
+        If 'gaussian', apply Gaussian smoothing before peak detection. Gaussian
+        smoothing is the BiSer0608 default.
     window : int
         Window size for diagonal profile computation.
     sigma : float
@@ -46,23 +48,44 @@ def find_auto_boundaries(df_or_matrix, valley, smooth=0, window=10,
     """
     window = int(window)
     order = int(order)
+    distance = int(distance)
+    if window < 1:
+        raise ValueError("window must be at least 1")
+    if distance < 1:
+        raise ValueError("distance must be at least 1")
 
     # Convert DataFrame to numpy array if necessary
     if hasattr(df_or_matrix, "to_numpy"):
         matrix = df_or_matrix.to_numpy()
     else:
-        matrix = df_or_matrix
+        matrix = np.asarray(df_or_matrix)
 
-    # Compute diagonal profile: mean of local neighborhood along the diagonal
+    matrix = np.asarray(matrix, dtype=float)
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("df_or_matrix must be a square two-dimensional matrix")
+    if matrix.shape[0] < 3:
+        return []
+
+    # Compute the symmetric diagonal-band profile described in BiSer0608. The
+    # diagonal itself is excluded so that self-similarity cannot mask valleys.
     def diagonal_profile(matrix, window=10):
         n = matrix.shape[0]
-        profile = []
+        profile = np.empty(n, dtype=float)
         for i in range(n):
             lo = max(0, i - window)
             hi = min(n, i + window + 1)
-            vals = [matrix[i, j] for j in range(lo, hi)]
-            profile.append(np.mean(vals))
-        return np.array(profile)
+            neighbors = np.r_[lo:i, i + 1:hi]
+            vals = matrix[i, neighbors]
+            finite = vals[np.isfinite(vals)]
+            profile[i] = np.mean(finite) if finite.size else np.nan
+
+        if np.any(~np.isfinite(profile)):
+            valid = np.flatnonzero(np.isfinite(profile))
+            if valid.size == 0:
+                raise ValueError("diagonal profile contains no finite values")
+            missing = np.flatnonzero(~np.isfinite(profile))
+            profile[missing] = np.interp(missing, valid, profile[valid])
+        return profile
 
     profile = diagonal_profile(matrix, window=window)
 
@@ -98,4 +121,4 @@ def find_auto_boundaries(df_or_matrix, valley, smooth=0, window=10,
     else:
         raise ValueError(f"Unknown valley method: {valley}")
 
-    return auto_boundaries
+    return [int(x) for x in np.sort(np.unique(auto_boundaries))]

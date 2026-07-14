@@ -1,109 +1,85 @@
 ################################################################################
-# Figure 2: Simulation Heatmap + Point-Plot with Error Bars
-#
-# Panel A: 3x3 heatmap grid (one simulation replicate)
-# Panel B: Mean +/- SD point plot for ARI, NMI, Purity across methods
-#
-# Required data: output/ALLout_norm_low.RData (or any simulation output)
+# Figure 2: mutually exclusive, low-noise, large Gaussian simulations
 ################################################################################
 
 source("R/visualization.R")
 
 library(ggplot2)
-library(patchwork)
 library(grid)
 library(gridExtra)
 library(viridis)
 library(dplyr)
 library(tidyr)
 
-# ==============================================================================
-# Configuration
-# ==============================================================================
-data_file  <- "output/ALLout_norm_low.RData"
+data_file <- "output/ALLout_norm_exc_low_1000.RData"
 output_dir <- "output"
-
-# Methods to display and their display order
 core_methods <- c("biser", "bs", "tsp_seri", "spec_seri", "Heatmap", "MESBC", "NMF")
 
-# ==============================================================================
-# Load data
-# ==============================================================================
 load(data_file)
 allmetric <- ALLout$allmetric
 
-# ==============================================================================
-# Panel A: Heatmap grid
-# ==============================================================================
-# Select a representative simulation replicate (best BiSer ARI)
-biser_ari <- sapply(allmetric, function(m) m["biser", "ARI"])
-best_iter <- which.max(biser_ari)
+# Use the replicate closest to the median BiSer ARI. This is deterministic and
+# avoids selecting the best-performing replicate for the representative panel.
+biser_ari <- vapply(allmetric, function(x) x["biser", "ARI"], numeric(1))
+representative <- which.min(abs(biser_ari - median(biser_ari, na.rm = TRUE)))
+info <- ALLout$trueinfo[[representative]]
+mat_input <- info$mat_input
+if (is.null(mat_input)) stop("Regenerate results with the BiSer0608 runner.")
 
-# Get original and reordered matrices
-true_mat   <- ALLout$trueinfo[[best_iter]]$mat
-biser_out  <- ALLout$allout[[best_iter]]$biser
-reord_mat  <- biser_out$reordered_mat
+heatmap_mats <- list(info$mat, mat_input)
+heatmap_titles <- c("Ground truth", "Disturbed")
+for (method in core_methods) {
+  out <- ALLout$allout[[representative]][[method]]
+  if (is.null(out) || is.null(out$row_order) || is.null(out$col_order)) {
+    stop("Missing ordering output for ", method, " in replicate ", representative)
+  }
+  heatmap_mats[[length(heatmap_mats) + 1L]] <-
+    mat_input[out$row_order, out$col_order, drop = FALSE]
+  heatmap_titles <- c(heatmap_titles, display_name[method])
+}
 
-# Build heatmap list: true, original (shuffled), and method-reordered
-# (Adjust according to available outputs in your data)
-heatmap_titles <- c("Ground Truth", "Shuffled", "BiSer")
-heatmap_mats   <- list(true_mat, true_mat[sample(nrow(true_mat)),
-                                           sample(ncol(true_mat))],
-                        reord_mat)
-
-color_pal <- viridis(100)
 panel_A <- get_multiple_heatmap_grob(
-  heatmap_mats, nrow = 1, ncol = 3,
-  title = heatmap_titles, color = color_pal,
-  legende_title = "Value"
+  heatmap_mats, nrow = 3, ncol = 3,
+  title = heatmap_titles, color = viridis(100), legende_title = "Value"
 )
 
-# ==============================================================================
-# Panel B: Mean +/- SD point plot (ARI, NMI, Purity)
-# ==============================================================================
-metrics_long <- bind_rows(lapply(seq_along(allmetric), function(i) {
-  df <- as.data.frame(allmetric[[i]])
-  df$Method <- rownames(df)
-  df$iter <- i
-  df
-}))
-
-metrics_sub <- metrics_long %>%
+metric_data <- bind_rows(lapply(seq_along(allmetric), function(i) {
+  data.frame(
+    Method = rownames(allmetric[[i]]),
+    ARI = allmetric[[i]][, "ARI"],
+    F1 = allmetric[[i]][, "F1"],
+    Accuracy = allmetric[[i]][, "Accuracy"],
+    replicate = i,
+    check.names = FALSE
+  )
+})) %>%
   filter(Method %in% core_methods) %>%
-  mutate(Method = display_name[Method]) %>%
-  mutate(Method = factor(Method, levels = method_order))
-
-metrics_summary <- metrics_sub %>%
-  select(Method, ARI, NMI, purity) %>%
-  pivot_longer(cols = c(ARI, NMI, purity), names_to = "Metric", values_to = "Value") %>%
+  mutate(Method = factor(display_name[Method], levels = method_order)) %>%
+  pivot_longer(c(ARI, F1, Accuracy), names_to = "Metric", values_to = "Score") %>%
   group_by(Method, Metric) %>%
-  summarise(Mean = mean(Value, na.rm = TRUE),
-            SD   = sd(Value, na.rm = TRUE), .groups = "drop")
+  summarise(Mean = mean(Score, na.rm = TRUE), SD = sd(Score, na.rm = TRUE),
+            .groups = "drop")
 
-panel_B <- ggplot(metrics_summary, aes(x = Method, y = Mean, color = Method)) +
-  geom_point(size = 4) +
-  geom_errorbar(aes(ymin = Mean - SD, ymax = pmin(Mean + SD, 1)),
-                width = 0.3, linewidth = 0.8) +
-  facet_wrap(~ Metric, scales = "free_y", nrow = 1) +
+panel_B <- ggplot(metric_data, aes(Method, Mean, color = Method)) +
+  geom_point(size = 3.5) +
+  geom_errorbar(
+    aes(ymin = pmax(Mean - SD, 0), ymax = pmin(Mean + SD, 1)),
+    width = 0.25, linewidth = 0.7
+  ) +
+  facet_wrap(~Metric, nrow = 1) +
   scale_color_manual(values = method_colors) +
+  coord_cartesian(ylim = c(0, 1)) +
   theme_pub +
   theme(
-    axis.text.x  = element_text(angle = 45, hjust = 1, size = 13),
-    strip.text   = element_text(size = 16, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+    strip.text = element_text(size = 14, face = "bold"),
     legend.position = "none"
   ) +
-  labs(x = NULL, y = "Score")
+  labs(x = NULL, y = "Mean score ± 1 SD")
 
-# ==============================================================================
-# Combine and save
-# ==============================================================================
 if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
-
-pdf(file.path(output_dir, "fig2_simulation_heatmap.pdf"), width = 16, height = 12)
-grid.arrange(
-  panel_A, ggplotGrob(panel_B),
-  nrow = 2, heights = c(1, 1)
-)
+pdf(file.path(output_dir, "fig2_simulation_heatmap.pdf"), width = 16, height = 14)
+grid.arrange(panel_A, ggplotGrob(panel_B), nrow = 2, heights = c(2.2, 1))
 dev.off()
 
 cat("Figure 2 saved to", file.path(output_dir, "fig2_simulation_heatmap.pdf"), "\n")
