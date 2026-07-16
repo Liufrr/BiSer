@@ -19,8 +19,12 @@ submission_metric_names <- c(
   "ARI_pre", "ARI_post", "discretization_penalty"
 )
 
-mean_row_col <- function(row_score, col_score) {
-  mean(c(unname(row_score), unname(col_score)), na.rm = TRUE)
+weighted_mean_row_col <- function(row_score, col_score, m, p) {
+  scores <- c(unname(row_score), unname(col_score))
+  weights <- c(m, p)
+  valid <- !is.na(scores)
+  if (!any(valid)) return(NA_real_)
+  sum(scores[valid] * weights[valid]) / sum(weights[valid])
 }
 
 purity_score <- function(truth, pred) {
@@ -94,35 +98,46 @@ validate_labels <- function(labels, truth, axis) {
   if (anyNA(labels) || any(labels == "")) stop(axis, " labels are incomplete.")
 }
 
-# The submission states that separate row and column scores are averaged. This
-# function therefore uses an unweighted arithmetic mean, not an (m+p)-weighted
-# mean as in the earlier development script.
+# Separate row and column scores are combined with weights proportional to the
+# corresponding numbers of row and column nodes.
 overlapbic_metric <- function(biclabel, truelabel, rsim = NULL, csim = NULL,
                               m = NULL, p = NULL) {
   validate_labels(biclabel$row, truelabel$row, "Row")
   validate_labels(biclabel$col, truelabel$col, "Column")
+  row_weight <- length(truelabel$row)
+  col_weight <- length(truelabel$col)
+  if (!is.null(m) && m != row_weight) stop("m does not match row label length.")
+  if (!is.null(p) && p != col_weight) stop("p does not match column label length.")
 
   out <- setNames(rep(NA_real_, length(submission_metric_names)),
                   submission_metric_names)
 
   out["NMI_row"] <- NMI(truelabel$row, biclabel$row)
   out["NMI_col"] <- NMI(truelabel$col, biclabel$col)
-  out["NMI"] <- mean_row_col(out["NMI_row"], out["NMI_col"])
+  out["NMI"] <- weighted_mean_row_col(
+    out["NMI_row"], out["NMI_col"], row_weight, col_weight
+  )
 
   out["purity_row"] <- purity_score(truelabel$row, biclabel$row)
   out["purity_col"] <- purity_score(truelabel$col, biclabel$col)
-  out["purity"] <- mean_row_col(out["purity_row"], out["purity_col"])
+  out["purity"] <- weighted_mean_row_col(
+    out["purity_row"], out["purity_col"], row_weight, col_weight
+  )
 
   out["ARI_row"] <- adjustedRandIndex(truelabel$row, biclabel$row)
   out["ARI_col"] <- adjustedRandIndex(truelabel$col, biclabel$col)
-  out["ARI"] <- mean_row_col(out["ARI_row"], out["ARI_col"])
+  out["ARI"] <- weighted_mean_row_col(
+    out["ARI_row"], out["ARI_col"], row_weight, col_weight
+  )
 
   class_row <- classification_scores(truelabel$row, biclabel$row)
   class_col <- classification_scores(truelabel$col, biclabel$col)
   for (metric in c("Accuracy", "precision", "recall", "F1")) {
     out[paste0(metric, "_row")] <- class_row[metric]
     out[paste0(metric, "_col")] <- class_col[metric]
-    out[metric] <- mean_row_col(class_row[metric], class_col[metric])
+    out[metric] <- weighted_mean_row_col(
+      class_row[metric], class_col[metric], row_weight, col_weight
+    )
   }
   out["sensitive"] <- out["recall"]
 
@@ -131,7 +146,9 @@ overlapbic_metric <- function(biclabel, truelabel, rsim = NULL, csim = NULL,
   for (metric in c("recovery", "relevance")) {
     out[paste0(metric, "_row")] <- set_row[[metric]]
     out[paste0(metric, "_col")] <- set_col[[metric]]
-    out[metric] <- mean_row_col(set_row[[metric]], set_col[[metric]])
+    out[metric] <- weighted_mean_row_col(
+      set_row[[metric]], set_col[[metric]], row_weight, col_weight
+    )
   }
 
   out["ARI_post"] <- out["ARI"]
@@ -142,11 +159,23 @@ overlapbic_metric <- function(biclabel, truelabel, rsim = NULL, csim = NULL,
 metric_micro <- function(allclus, label, m = NULL, p = NULL) {
   row <- classification_scores(label$row, allclus$row)
   col <- classification_scores(label$col, allclus$col)
+  row_weight <- length(label$row)
+  col_weight <- length(label$col)
+  if (!is.null(m) && m != row_weight) stop("m does not match row label length.")
+  if (!is.null(p) && p != col_weight) stop("p does not match column label length.")
   list(
-    accurate = mean_row_col(row["Accuracy"], col["Accuracy"]),
-    precision = mean_row_col(row["precision"], col["precision"]),
-    sensitive = mean_row_col(row["recall"], col["recall"]),
-    F1 = mean_row_col(row["F1"], col["F1"])
+    accurate = weighted_mean_row_col(
+      row["Accuracy"], col["Accuracy"], row_weight, col_weight
+    ),
+    precision = weighted_mean_row_col(
+      row["precision"], col["precision"], row_weight, col_weight
+    ),
+    sensitive = weighted_mean_row_col(
+      row["recall"], col["recall"], row_weight, col_weight
+    ),
+    F1 = weighted_mean_row_col(
+      row["F1"], col["F1"], row_weight, col_weight
+    )
   )
 }
 
