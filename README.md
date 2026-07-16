@@ -51,7 +51,7 @@ BiSer removes zero-degree nodes before normalization, excludes the degree-relate
 
 The boundary profile averages a symmetric diagonal band while excluding self-similarities. The profile is smoothed with a one-dimensional Gaussian filter (`sigma=3` by default), after which valleys are retained using minimum prominence and spacing constraints.
 
-Separate row and column scores are combined by an unweighted arithmetic mean, as stated in the manuscript. The saved metric matrices contain ARI, NMI, purity, accuracy, precision, recall, F1, recovery, and relevance, together with:
+Separate row and column scores are combined by an arithmetic mean weighted by the corresponding numbers of row and column nodes. The saved metric matrices contain ARI, NMI, purity, accuracy, precision, recall, F1, recovery, and relevance, together with:
 
 - `ARI_pre`: oracle segmentation of the recovered continuous order using the true number and sizes of groups
 - `ARI_post`: ARI after data-driven boundary detection
