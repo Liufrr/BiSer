@@ -67,19 +67,7 @@ generate_NBP <- function(bicrnum = c(20, 50, 50, 30, 100),
   centerr <- c(1, cumsum(bicrnum[-bicnum]) + 1)
   centerc <- c(1, cumsum(biccnum[-bicnum]) + 1)
 
-  # Clear block regions before adding signal
-  for (i in 1:bicnum) {
-    row_start <- max(1, centerr[i] - overr[i])
-    row_end   <- min(m, centerr[i] + bicrnum[i] + overr[i] - 1)
-    col_start <- max(1, centerc[i] - overc[i])
-    col_end   <- min(p, centerc[i] + biccnum[i] + overc[i] - 1)
-    block_rows <- row_start:row_end
-    block_cols <- col_start:col_end
-    mat[block_rows, block_cols] <- matrix(0, nrow = length(block_rows),
-                                          ncol = length(block_cols))
-  }
-
-  # Add block signal
+  # Add block signal to the background matrix
   for (i in 1:bicnum) {
     row_start <- max(1, centerr[i] - overr[i])
     row_end   <- min(m, centerr[i] + bicrnum[i] + overr[i] - 1)
